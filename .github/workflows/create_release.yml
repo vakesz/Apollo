@@ -8,10 +8,6 @@ on:
         description: 'Apollo .ipa URL'
         required: false
         default: 'https://files.catbox.moe/o2lue0.ipa'
-      catbox_upload:
-        description: 'Upload to Catbox.moe'
-        type: boolean
-        default: false
 
 permissions:
   contents: write
@@ -19,9 +15,9 @@ permissions:
 env:
   PYTHON_VERSION: '3.13'
   APOLLO_IPA_URL: ${{ inputs.apollo_ipa_url || 'https://files.catbox.moe/o2lue0.ipa' }}
-  CATBOX_UPLOAD: ${{ inputs.catbox_upload == 'false' }}
   GITHUB_API_URL: "https://api.github.com/repos/JeffreyCA/Apollo-ImprovedCustomApi/releases/latest"
   PYZULE_RW_URL: "https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip"
+  APOLLO_PATCHER_REPO: "https://github.com/JeffreyCA/Apollo-ImprovedCustomApi.git"
 
 jobs:
   build-apollo-ipa:
@@ -96,68 +92,55 @@ jobs:
           echo "ICA_VERSION=$ICA_VERSION" >> "$GITHUB_OUTPUT"
           echo "OUTPUT_NAME=Apollo-${APOLLO_VERSION}_ImprovedCustomApi-${ICA_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Setup build folders
+      - name: Fetch Apollo patcher (Liquid Glass assets + patch.sh)
         env:
-            OUTPUT_NAME: ${{ steps.download-files.outputs.OUTPUT_NAME }}
+          RELEASE_TAG: ${{ steps.get-release.outputs.RELEASE_TAG }}
         run: |
-          mkdir -p "${OUTPUT_NAME}/Payload"
-          mkdir -p "NO-EXTENSIONS_${OUTPUT_NAME}/Payload"
+          git clone --depth 1 --branch "$RELEASE_TAG" "$APOLLO_PATCHER_REPO" apollo-patcher
+          chmod +x apollo-patcher/patch.sh
+          test -f apollo-patcher/liquid-glass/prebuilt/Assets.car
+          test -f apollo-patcher/liquid-glass/icons.json
 
-      - name: Build modified .ipa
+      - name: Build IPAs (regular + no-extensions, plain + Liquid Glass)
         env:
-            OUTPUT_NAME: ${{ steps.download-files.outputs.OUTPUT_NAME }}
-        working-directory: ${{ steps.download-files.outputs.OUTPUT_NAME }}
+          OUTPUT_NAME: ${{ steps.download-files.outputs.OUTPUT_NAME }}
         run: |
-          cyan -i "${GITHUB_WORKSPACE}/Apollo.ipa" -o "Payload/Apollo.app" -f "${GITHUB_WORKSPACE}/improvedcustomapi.deb" --fakesign
-          echo "Zipping ${OUTPUT_NAME}.ipa"
-          zip -6 -rq "${OUTPUT_NAME}.ipa" "Payload" -x "*/.*"
+          build_variant() {
+            local prefix="$1"      # "" for regular, "NO-EXTENSIONS_" for no-extensions
+            local cyan_extra="$2"  # "" for regular, "-e" for no-extensions
+            local dir="${prefix}${OUTPUT_NAME}"
+            local ipa="${prefix}${OUTPUT_NAME}.ipa"
+            local glass_ipa="${prefix}GLASS_${OUTPUT_NAME}.ipa"
 
-          echo "Updating build version in Apollo Executable!"
-          echo "Previous $(vtool -show-build Payload/Apollo.app/Apollo)"
-          vtool -set-build-version ios 15.0 19.0 -replace -output "Payload/Apollo.app/Apollo" "Payload/Apollo.app/Apollo"
-          echo "Updated $(vtool -show-build Payload/Apollo.app/Apollo)"
+            mkdir -p "${dir}/Payload"
+            pushd "${dir}" >/dev/null
 
-          echo "Checking for duplicate LC_RPATH entries..."
-          executable_path_count=$(otool -l "Payload/Apollo.app/Apollo" | grep -A 2 LC_RPATH | grep "@executable_path/Frameworks" | wc -l | tr -d ' ')
-          echo "Found $executable_path_count @executable_path/Frameworks LC_RPATH entries"
-          if [ "$executable_path_count" -gt 1 ]; then
-            echo "Removing duplicate @executable_path/Frameworks LC_RPATH entry..."
-            install_name_tool -delete_rpath "@executable_path/Frameworks" "Payload/Apollo.app/Apollo"
-            echo "Duplicate LC_RPATH entry removed"
-          fi
+            local cyan_args=(-i "${GITHUB_WORKSPACE}/Apollo.ipa" -o "Payload/Apollo.app" -f "${GITHUB_WORKSPACE}/improvedcustomapi.deb" --fakesign)
+            [ -n "$cyan_extra" ] && cyan_args+=("$cyan_extra")
 
-          echo "Fake Signing Apollo Executable!"
-          ldid -S -M "Payload/Apollo.app/Apollo"
-          echo "Zipping ${OUTPUT_NAME}.ipa"
-          zip -6 -rq "GLASS_${OUTPUT_NAME}.ipa" "Payload" -x "*/.*"
+            echo "Building ${ipa} with cyan..."
+            cyan "${cyan_args[@]}"
+            zip -6 -rq "${ipa}" Payload -x "*/.*"
 
-      - name: Build no extension modified .ipa
-        env:
-            OUTPUT_NAME: ${{ steps.download-files.outputs.OUTPUT_NAME }}
-        working-directory: NO-EXTENSIONS_${{ steps.download-files.outputs.OUTPUT_NAME }}
-        run: |
-          cyan -i "${GITHUB_WORKSPACE}/Apollo.ipa" -o "Payload/Apollo.app" -f "${GITHUB_WORKSPACE}/improvedcustomapi.deb" --fakesign -e
-          echo "Zipping NO-EXTENSIONS_${OUTPUT_NAME}.ipa"
-          zip -6 -rq "NO-EXTENSIONS_${OUTPUT_NAME}.ipa" "Payload" -x "*/.*"
+            echo "Applying Liquid Glass patch -> ${glass_ipa}..."
+            bash "${GITHUB_WORKSPACE}/apollo-patcher/patch.sh" "${ipa}" --liquid-glass -o "${glass_ipa}"
 
-          echo "Updating build version in Apollo Executable!"
-          echo "Previous $(vtool -show-build Payload/Apollo.app/Apollo)"
-          vtool -set-build-version ios 15.0 19.0 -replace -output "Payload/Apollo.app/Apollo" "Payload/Apollo.app/Apollo"
-          echo "Updated $(vtool -show-build Payload/Apollo.app/Apollo)"
+            echo "Re-fakesigning patched Apollo executable with ldid..."
+            rm -rf glass_resign
+            unzip -q "${glass_ipa}" -d glass_resign
+            local app_path exec_name
+            app_path=$(find glass_resign/Payload -maxdepth 1 -type d -name '*.app' | head -1)
+            exec_name=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "${app_path}/Info.plist")
+            ldid -S -M "${app_path}/${exec_name}"
+            rm "${glass_ipa}"
+            (cd glass_resign && zip -6 -rq "../${glass_ipa}" Payload -x "*/.*")
+            rm -rf glass_resign
 
-          echo "Checking for duplicate LC_RPATH entries..."
-          executable_path_count=$(otool -l "Payload/Apollo.app/Apollo" | grep -A 2 LC_RPATH | grep "@executable_path/Frameworks" | wc -l | tr -d ' ')
-          echo "Found $executable_path_count @executable_path/Frameworks LC_RPATH entries"
-          if [ "$executable_path_count" -gt 1 ]; then
-            echo "Removing duplicate @executable_path/Frameworks LC_RPATH entry..."
-            install_name_tool -delete_rpath "@executable_path/Frameworks" "Payload/Apollo.app/Apollo"
-            echo "Duplicate LC_RPATH entry removed"
-          fi
+            popd >/dev/null
+          }
 
-          echo "Fake Signing Apollo Executable!"
-          ldid -S -M "Payload/Apollo.app/Apollo"
-          echo "Zipping NO-EXTENSIONS_GLASS_${OUTPUT_NAME}.ipa"
-          zip -6 -rq "NO-EXTENSIONS_GLASS_${OUTPUT_NAME}.ipa" "Payload" -x "*/.*"
+          build_variant "" ""
+          build_variant "NO-EXTENSIONS_" "-e"
 
       - name: Generate release notes
         env:
@@ -195,28 +178,7 @@ jobs:
             NO-EXTENSIONS_${{ steps.download-files.outputs.OUTPUT_NAME }}/NO-EXTENSIONS_${{ steps.download-files.outputs.OUTPUT_NAME }}.ipa
             NO-EXTENSIONS_${{ steps.download-files.outputs.OUTPUT_NAME }}/NO-EXTENSIONS_GLASS_${{ steps.download-files.outputs.OUTPUT_NAME }}.ipa
 
-      - name: Upload to catbox
-        if: env.CATBOX_UPLOAD == 'true'
-        env:
-          OUTPUT_NAME: ${{ steps.download-files.outputs.OUTPUT_NAME }}
-        run: |
-          if [ -z "${APOLLO_VERSION}" ] || [ -z "${ICA_VERSION}" ]; then
-            echo "Error: Missing required information for uploading to Catbox!"
-            exit 1
-          fi
-
-          CATBOX_URL=$(curl -F "fileToUpload=@${OUTPUT_NAME}/${OUTPUT_NAME}.ipa" https://catbox.moe/user/api.php)
-          CATBOX_URL_GLASS=$(curl -F "fileToUpload=@${OUTPUT_NAME}/GLASS_${OUTPUT_NAME}.ipa" https://catbox.moe/user/api.php)
-
-          CATBOX_URL_NO_EXT=$(curl -F "fileToUpload=@NO-EXTENSIONS_${OUTPUT_NAME}/NO-EXTENSIONS_${OUTPUT_NAME}.ipa" https://catbox.moe/user/api.php)
-          CATBOX_URL_NO_EXT_GLASS=$(curl -F "fileToUpload=@NO-EXTENSIONS_${OUTPUT_NAME}/NO-EXTENSIONS_GLASS_${OUTPUT_NAME}}.ipa" https://catbox.moe/user/api.php)
-
-          echo "CATBOX_URL=${CATBOX_URL}" >> "$GITHUB_ENV"
-          echo "CATBOX_URL_GLASS=${CATBOX_URL_GLASS}" >> "$GITHUB_ENV"
-          echo "CATBOX_URL_NO_EXT=${CATBOX_URL_NO_EXT}" >> "$GITHUB_ENV"
-          echo "CATBOX_URL_NO_EXT_GLASS=${CATBOX_URL_NO_EXT_GLASS}" >> "$GITHUB_ENV"
-
-      - name: Update source files
+      - name: Commit source updates and release marker
         env:
           RELEASE_TAG: ${{ steps.get-release.outputs.RELEASE_TAG }}
         run: |
@@ -225,35 +187,21 @@ jobs:
 
           git fetch origin main
           git checkout main
-          git pull origin main
+          git pull --rebase origin main
 
           python update_json.py
-
-          git add apps.json apps_noext.json
-
-          if git diff --cached --quiet; then
-            echo "No changes detected, skipping commit."
-          else
-            git commit -m "update source files for $RELEASE_TAG"
-            git push origin main || (git pull --rebase origin main && git push origin main)
-          fi
-
-      - name: Update release marker
-        env:
-          RELEASE_TAG: ${{ steps.get-release.outputs.RELEASE_TAG }}
-        run: |
-          git pull origin main
           echo "$RELEASE_TAG" > .current-release
-          git add .current-release
+
+          git add apps.json apps_noext.json .current-release
           if git diff --cached --quiet; then
-            echo "Release marker already up to date, skipping commit."
+            echo "Nothing to commit."
           else
-            git commit -m "mark $RELEASE_TAG as released"
+            git commit -m "release $RELEASE_TAG"
             git push origin main || (git pull --rebase origin main && git push origin main)
           fi
 
       - name: Job summary
         run: |
           echo "### 📊 Workflow Summary" >> $GITHUB_STEP_SUMMARY
-          echo "✅ New release created: v${{ steps.download-files.outputs.APOLLO_VERSION }}-${{ steps.download-files.outputs.ICA_VERSION }}" >> $GITHUB_STEP_SUMMARY
+          echo "✅ New release created: v${{ steps.download-files.outputs.APOLLO_VERSION }}_${{ steps.download-files.outputs.ICA_VERSION }}" >> $GITHUB_STEP_SUMMARY
           echo "🔗 [View release](https://github.com/${{ github.repository }}/releases/tag/v${{ steps.download-files.outputs.APOLLO_VERSION }}_${{ steps.download-files.outputs.ICA_VERSION }})" >> $GITHUB_STEP_SUMMARY
